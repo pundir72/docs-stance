@@ -1,4 +1,4 @@
-# Clinician Agent — Simple Overview
+# Clinician Agent — Overview
 
 ## What is the Clinician Agent?
 
