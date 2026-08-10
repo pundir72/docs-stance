@@ -1,177 +1,617 @@
-# Stance AI Clinical Summarizer
+# Stance Summarizer and Phase Agent
 
-## Executive Project Overview
+## Technical Project Audit, Module Inventory, Cost Review, and Optimization Plan
 
-### 1. Purpose
+**Reviewed branch:** `v27.5.3-prod`  
+**Reviewed commit:** `cb25742`  
+**Review basis:** Static analysis of the current repository, runtime entry points, imports, API routes, MongoDB access paths, AI calls, Docker definitions, Nginx routing, and deployment workflow.  
+**Audience:** Client discussions, engineering handover, technical leadership, and production planning.
 
-Stance is an AI-assisted rehabilitation decision-support platform. It combines longitudinal clinical records with objective VALD performance data and produces:
+---
 
-- A concise clinical summary of the patient's condition, progress, risks, and missing information.
-- A phase-wise rehabilitation analysis comparing expected recovery with actual progress.
+## 1. Executive summary
 
-The product reduces the time required to review fragmented patient history and gives clinicians a consistent view of the rehabilitation journey. It supports clinical judgment; it does not replace the clinician.
+This project is an AI-assisted rehabilitation decision-support backend. It reads a patient's longitudinal clinical records and VALD measurements, builds a chronological timeline, and generates two independent clinical outputs:
 
-### 2. Client explanation
+1. A structured clinical summary describing the patient's condition, evidence, progress, risks, adherence, and gaps.
+2. A rehabilitation phase analysis comparing expected rehabilitation stages with actual activity and progress.
 
-> The platform brings a patient's clinical assessments and VALD measurements into one chronological timeline. Specialized AI pipelines then generate a concise clinical summary and a rehabilitation phase analysis. A central orchestrator monitors relevant patient activity and controls when each analysis runs, preventing unnecessary repeated processing. The structured results are stored in MongoDB and displayed through the clinical application for clinician review.
+A third service, the Audit Orchestrator, watches MongoDB activity and decides when either AI pipeline should run. Nginx is the public HTTPS and WebSocket gateway.
 
-### 3. Production architecture
+### Client-ready explanation
 
-The application is deployed as three independent backend services:
+> Stance converts fragmented clinical notes and objective VALD measurements into one chronological patient view. It then uses specialized AI pipelines to create a concise clinical summary and a phase-wise rehabilitation assessment. A central orchestration service controls when generation occurs, while the final structured results are stored in MongoDB for clinician review.
 
-| Service | Responsibility | Output |
-|---|---|---|
-| Clinical Auditor | Explains the patient's overall clinical status and progress | Structured clinical summary |
-| Phase Analysis | Explains the patient's position in the rehabilitation pathway | Structured phase analysis |
-| Audit Orchestrator | Decides when and which pipeline should run | Queue and operational state |
+The product should be described as clinician-reviewed decision support, not autonomous diagnosis or treatment.
 
-Nginx provides HTTPS and WebSocket routing in front of these services.
+### Overall engineering assessment
 
-```mermaid
-flowchart LR
-    A[Clinical records] --> O[Audit Orchestrator]
-    B[VALD data] --> O
-    O --> S[Clinical Auditor]
-    O --> P[Phase Analysis]
-    S --> X[Clinical summary]
-    P --> Y[Patient phases]
-    X --> F[Clinical application]
-    Y --> F
-```
+The core clinical workflow is implemented and the three-service separation is sensible. However, the current branch has material reliability, security, deployment, and cost-efficiency gaps:
 
-#### Clinical Auditor — port 5001
+- A successful HTTP dispatch is treated as a completed AI job even though both downstream endpoints only accept background work.
+- Shared queue fields are cleared after one pipeline runs, which can incorrectly mark or suppress the other pipeline.
+- A combined automatic run performs approximately four clinical-history reads, three VALD reads, and about eight normal AI generations per patient.
+- The concise-summary stage repeats AI processing section by section and is the largest avoidable AI-call multiplier.
+- Full source records are nested repeatedly in the timeline sent to the model, increasing prompt size and patient-data exposure.
+- Several disconnected functions, old CLI paths, stale deployment files, and unused dependencies remain in the repository.
+- Production credentials and a private key are tracked in Git, and one source file contains a hardcoded database fallback credential. All affected credentials must be rotated.
+- APIs have no application authentication and broad CORS configuration.
+- There are no automated tests.
+- The CI workflow does not actually select the dev Compose definition for dev branches.
 
-The Clinical Auditor:
+The system should not be presented as fully optimized or production-hardened until the priority-zero and priority-one items in this document are addressed.
 
-1. Loads clinical history and VALD measurements from MongoDB.
-2. Builds a chronological patient timeline.
-3. Uses Gemini to produce an evidence-informed assessment.
-4. Uses a concise-summary stage to normalize the report.
-5. Parses the report into structured fields.
-6. Upserts the result into the configured summary collection.
+---
 
-The output covers the patient overview, complaint, provisional diagnosis, objective evidence, progress, areas of concern, information gaps, adherence, and references.
+## 2. The three production parts
 
-#### Phase Analysis — port 5002
+| Service | Port | Primary responsibility | Uses AI | Persistent output |
+|---|---:|---|---|---|
+| Clinical Auditor | 5001 | Builds an evidence-informed clinical assessment and concise summary | Yes | Configured summary collection, currently `new-summary` in root Compose |
+| Phase Analysis | 5002 | Determines ideal-versus-actual rehabilitation phases | Yes | Configured phase collection, normally `patient-phases` |
+| Audit Orchestrator | 5003 | Watches activity, maintains a queue, applies thresholds, and dispatches pipelines | No | `pending_audits`, resume tokens, and estimated cost reports |
 
-The Phase Analysis service uses the same patient timeline but answers a different question: where the patient is in the rehabilitation pathway.
+Nginx is supporting infrastructure rather than a fourth business service. It terminates TLS and routes public summary, phase, orchestrator, and WebSocket traffic.
 
-It produces ideal-versus-actual phase dates, expected and completed sessions, clinical focus, exit criteria, functional status, missed areas, immediate priorities, future phases, and phase-mismatch alerts. Results are upserted into the patient phase collection.
+### Difference between the three
 
-#### Audit Orchestrator — port 5003
+- The Clinical Auditor answers: **What is the patient's overall clinical state and rehabilitation story?**
+- Phase Analysis answers: **Where is the patient in the rehabilitation pathway, and what phase work is missing or delayed?**
+- The Orchestrator answers: **Should either analysis run now, and how should that work be queued?**
 
-The orchestrator contains no clinical AI. It:
+The first two services interpret clinical data. The orchestrator does not interpret clinical data; it controls execution.
 
-- Watches clinical report and VALD changes through MongoDB change streams.
-- Filters processing to configured centers.
-- Deduplicates repeated edits to the same report or VALD record.
-- Maintains one processing record per patient.
-- Applies automatic-generation thresholds.
-- Dispatches summary and phase processing.
-- Handles manual frontend triggers.
-- Controls concurrency, retry attempts, and estimated processing cost.
+---
 
-### 4. Data flow
+## 3. End-to-end runtime flow
+
+### Automatic generation
 
 ```text
-MongoDB clinical records + VALD records
-    → normalize and sort chronologically
-    → create hierarchical patient timeline
-    → run the requested AI pipeline
-    → validate and structure the AI response
-    → upsert the patient result in MongoDB
-    → display the result in the frontend
+MongoDB change in reports or vald-exercise-data
+  -> ChangeStreamWatcher validates patient/center and deduplicates the source ID
+  -> AuditQueue updates one pending_audits row per patient
+  -> Scheduler checks 5-report, 5-VALD, or 15-day fallback eligibility
+  -> Scheduler calls Clinical Auditor and Phase Analysis concurrently
+  -> Each service independently reloads and transforms the patient history
+  -> Gemini generates its output
+  -> Parser validates and upserts structured output into MongoDB
 ```
 
-Primary data stores:
+### Manual generation
 
-| Data store | Role |
+```text
+Frontend opens the summary or phase WebSocket
+  -> API sends /manual-trigger to the orchestrator with a pipeline name
+  -> Orchestrator checks its queue timestamps and pending edit arrays
+  -> It either sends an up-to-date response or calls the selected REST endpoint
+  -> REST endpoint accepts a background task and immediately returns 2xx
+```
+
+### Source and destination collections
+
+| Collection/view | Usage |
 |---|---|
-| `structured-user-reports` | Consolidated clinical history used by the AI pipeline |
-| `vald-exercise-data` | Objective VALD measurements |
-| `pending_audits` | Per-patient orchestration state |
-| Summary collection | Final structured clinical summaries |
-| Phase collection | Final structured phase analysis |
-| `orchestrator_resume_tokens` | Change-stream recovery positions |
-| `orchestrator_cost_reports` | Estimated daily generation cost |
+| `reports` | Raw clinical-record changes watched by the orchestrator |
+| `structured-user-reports` | Consolidated clinical history loaded by both AI pipelines |
+| `vald-exercise-data` | VALD source changes and objective measurements |
+| `appointments` | Center eligibility lookup for the orchestrator |
+| `pending_audits` | One orchestration state row per patient |
+| `new-summary` or configured summary collection | Parsed clinical summaries |
+| `patient-phases` or configured phase collection | Parsed phase analysis |
+| `orchestrator_resume_tokens` | MongoDB change-stream recovery tokens |
+| `orchestrator_cost_reports` | Static estimated daily generation cost |
 
-### 5. Generation workflows
+The watcher observes `reports`, while the AI loaders read `structured-user-reports`. This appears to rely on an external aggregation/view process. That dependency is not created or managed by this repository.
 
-#### Automatic
+---
 
-The orchestrator accumulates distinct report and VALD changes. With current code defaults, processing becomes eligible after five distinct clinical report edits, five distinct VALD edits, or the configured fallback condition.
+## 4. Module-by-module inventory
 
-Automatic processing normally dispatches both summary and phase pipelines.
+Status meanings:
 
-#### Manual
+- **Active:** Called by the deployed runtime.
+- **Supporting:** Used for deployment, routing, configuration, or operations.
+- **CLI only:** Usable manually but not part of the deployed request path.
+- **Legacy/disconnected:** Present but not reached by the current deployed flow.
+- **Broken/obsolete:** References missing or inconsistent runtime components.
 
-The frontend sends a WebSocket request for either summary or phase analysis. The receiving service delegates the request to the orchestrator. The orchestrator checks the selected pipeline and either dispatches it or reports that the result is already up to date.
+### 4.1 API modules
 
-### 6. AI design
+| Module | Status | Responsibility | Review notes |
+|---|---|---|---|
+| `api/summary_api.py` | Active, with legacy sections | FastAPI service for summary REST routes, WebSockets, background jobs, patient/report queries, and orchestration delegation | Very large mixed-responsibility module. Contains unused old direct WebSocket runners, unused patient locks, in-memory jobs, and a failed import in its preliminary data-preparation step. |
+| `api/phase_analysis_ws.py` | Active, with legacy sections | FastAPI service for phase REST trigger, WebSocket trigger delegation, background execution, validation, persistence, and jobs | The REST background job does not broadcast progress to delegated WebSocket clients. `/up-to-date` calls a nonexistent `broadcast` method. Old direct WebSocket runner is disconnected. |
 
-The system separates responsibilities across specialized stages:
+Important API behavior:
 
-- **Evidence-Based Assessment:** Interprets the full longitudinal record and can use Google Search grounding for supporting evidence.
-- **Concise Summary:** Converts the comprehensive assessment into a stable, frontend-friendly clinical summary.
-- **Phase Intelligence:** Applies a structured rehabilitation framework and compares expected phases with actual patient activity.
+- `POST /api/audits` and `POST /phase-analysis` are fire-and-forget endpoints. Their 2xx responses mean **accepted**, not **completed**.
+- Jobs live only in process memory. Restarting a container loses job history and state.
+- The cancel endpoint changes a job status but does not stop an already running thread/model request.
+- Health checks prove that the web process responds; they do not prove MongoDB or Vertex AI readiness.
+- Summary and phase WebSocket protocols use ad hoc colon-delimited text rather than a versioned JSON event schema.
+- `GET /api/reports/{filename}` exposes server-side generated report artifacts by filename. It should be removed or strictly authorized if artifacts are retained.
 
-Gemini fallback models are configured so temporary model availability or rate-limit problems can move processing to another model.
+### 4.2 Clinical-summary modules
 
-### 7. Business value
+| Module | Status | Responsibility | Review notes |
+|---|---|---|---|
+| `LLM/report-gen/run_audit_by_stance_id.py` | Active and CLI | Main summary workflow coordinator | Loads patient data more than once, invokes the shared pipeline, writes Markdown artifacts, rereads a file for parsing, and contains a hardcoded MongoDB fallback credential. |
+| `LLM/report-gen/eba_agent.py` | Active, with legacy methods | Builds the evidence-based assessment prompt and calls Gemini with Google Search grounding | One normal grounded generation, but full-report validation can repeat it. Large prompt, layered fallbacks, stale 2020–2024 research instruction, and unused earlier generation/helper methods. |
+| `LLM/report-gen/concise_agent.py` | Active | Parses the EBA Markdown into sections and asks Gemini to condense verbose sections | Processes multiple sections independently, including parent sections and extracted subsections. This is the main AI-call and latency multiplier. Per-section output ceiling is 65,536 tokens. |
+| `LLM/report-gen/push_report_to_mongo.py` | Active and CLI | Parses concise Markdown, normalizes fields, validates patient ID/sections, and upserts the summary | More than 1,000 lines and tightly coupled to exact Markdown headings. A schema-driven model response would remove much of this parsing risk. |
+| `LLM/report-gen/export_patient_raw_data.py` | CLI only | Exports patient clinical data to JSON | Not imported by production. Uses path assumptions intended for manual execution. |
+| `LLM/report-gen/export_vald_data.py` | CLI only / duplicate | Independently fetches and exports VALD data | Duplicates functionality available in the active shared VALD transformer. Candidate for removal or relocation to a tools directory. |
 
-- Faster review of long patient histories.
-- Consistent clinical summaries across patients.
-- Clear correlation between clinical observations and VALD measurements.
-- Better visibility into improvement, plateau, regression, and missing information.
-- Phase-level comparison of expected and actual rehabilitation.
-- Centralized control of AI triggers, concurrency, and estimated cost.
-- Structured outputs suitable for dashboards and integrations.
+### 4.3 Shared data-processing modules
 
-### 8. Technology and deployment
+| Module | Status | Responsibility | Review notes |
+|---|---|---|---|
+| `LLM/shared/load_reports_from_mongo.py` | Active | Reads `structured-user-reports` and transforms embedded reports into clinical records | Stores extracted fields and the entire original report under `raw_data`, duplicating content. TLS certificate and hostname verification are disabled. |
+| `LLM/shared/fetch_and_transform_vald.py` | Active | Reads `vald-exercise-data`, removes invalid zero-force metrics, and normalizes exercises/sessions | Creates repeated exercise/session structures and prints extensive debug information. TLS verification is disabled. |
+| `LLM/shared/chronological_data_processor.py` | Active, with unused methods | Combines clinical and VALD events into chronological and hierarchical timelines | Active timeline creation is useful; `generate_chronological_context` and `save_chronological_report` are not called by production. Creates another loader/connection per instance. |
+| `LLM/shared/agent_data_pipeline.py` | Active, with CLI-only helpers | Converts the merged patient timeline into the agent payload used by EBA and Phase Intelligence | Saves JSON artifacts on every production run. `get_agent_ready_data` is disconnected; `stream_to_agent` and `save_agent_payload` are only used by its manual entry point. |
+| `LLM/shared/rehabilitation_phases.py` | Legacy/disconnected | Defines deterministic rehabilitation phase data structures and matching utilities | No current module imports or calls it. The live phase pipeline instead embeds its rehabilitation logic in the Gemini prompt. |
 
-| Layer | Technology |
-|---|---|
-| APIs | Python, FastAPI, Uvicorn |
-| Database | MongoDB Atlas, PyMongo change streams |
-| AI | Google Vertex AI, Gemini, Google Search grounding |
-| Real-time communication | WebSockets |
-| Packaging | Docker and Docker Compose |
-| Public routing | Nginx with TLS |
-| Hosting and delivery | AWS EC2 and GitHub Actions |
+### 4.4 Phase-analysis modules
 
-The frontend is not part of this repository.
+| Module | Status | Responsibility | Review notes |
+|---|---|---|---|
+| `LLM/phase-analysis/phase_intelligence_engine.py` | Active and CLI | Builds the shared patient timeline, prompts Gemini for phase intelligence, and writes Markdown/CSV reports | One normal model generation. Production API writes both Markdown and CSV even though persistence parses the in-memory text. |
+| `LLM/phase-analysis/push_phases_to_mongo.py` | Active, with CLI-only paths | Parses, validates, and upserts phase output | API uses parsing and push functions directly. File-processing entry point is CLI only; text-processing wrapper is used by the engine's CLI path, not the API path. |
 
-### 9. Current scope
+### 4.5 Orchestrator modules
 
-Implemented capabilities include MongoDB ingestion, chronological timeline preparation, AI summary generation, phase analysis, structured persistence, automatic orchestration, manual triggers, WebSocket communication, cost estimation, containerized deployment, and HTTPS routing.
+| Module | Status | Responsibility | Review notes |
+|---|---|---|---|
+| `orchestrator/main.py` | Active | Initializes config, queue indexes, recovery, watcher threads, scheduler, and FastAPI/Uvicorn | Correct runtime entry point for the orchestrator container. |
+| `orchestrator/config.py` | Active | Reads thresholds, URLs, collections, concurrency, centers, ports, and static cost values | Defaults are operational policy embedded in code; production should validate all required configuration at startup. |
+| `orchestrator/watcher.py` | Active | Watches `reports` and `vald-exercise-data`, filters by center, extracts patient/source IDs, and persists resume tokens | Center lookup cache has no invalidation. A patient whose appointment/center changes can retain a stale authorization result until restart. |
+| `orchestrator/queue.py` | Active | Maintains per-patient pending/in-flight state, edit deduplication, threshold queries, retry state, and timestamps | One shared pair of edit arrays is used for two pipelines. This cannot accurately represent separate summary and phase checkpoints. |
+| `orchestrator/scheduler.py` | Active | Dispatches ready work, handles manual triggers, performs external-summary supersession, and writes cost estimates | Marks dispatch complete on downstream acceptance; creates a new HTTP client per call; cost logic assumes phase count equals summary count. |
+| `orchestrator/api.py` | Active | Exposes health, stats, queue inspection, force dispatch, manual trigger, and cost report routes | Operational and mutation routes have no authentication. Queue documents are returned with minimal access control or redaction. |
+| `orchestrator/log.py` | Active | Central logging setup | Small and appropriate, but application code still uses many direct `print` calls. |
+| `orchestrator/__init__.py` | Active package marker | Package metadata/documentation | No material runtime logic. |
 
-The system should be presented as clinician-reviewed decision support. Security controls, clinical governance, monitoring, test coverage, and reliable end-to-end completion tracking must be evaluated as part of production operations rather than assumed from the AI workflow alone.
+### 4.6 Deployment and operational files
 
-### 10. Genuine KT confirmations
+| File | Status | Responsibility | Review notes |
+|---|---|---|---|
+| `docker-compose.yml` | Active deployment definition | Runs the three prod-named services plus Nginx | Exposes all three service ports publicly in addition to Nginx. Uses source-code bind mounts in production, reducing image immutability. |
+| `services/clinical-auditor/Dockerfile` | Active | Python 3.13 clinical service image | Installs a broad, unpinned dependency set; source under `LLM` is supplied only by a runtime bind mount. |
+| `services/phase-analysis/Dockerfile` | Active | Python 3.13 phase service image | Same dependency and image-reproducibility concerns. |
+| `services/audit-orchestrator/Dockerfile` | Active | Python 3.11 orchestrator image | Dependencies are pinned and health check is meaningful at HTTP-process level. |
+| `nginx/nginx.conf` | Active | TLS termination, REST proxying, and WebSocket upgrades | Only prod hostnames are configured. CI attempts certificates for additional dev names that Nginx does not serve. |
+| `.github/workflows/deploy.yml` | Active, defective environment selection | Syncs repository to EC2, writes environment values, and rebuilds Compose | Both dev and prod branches select `docker-compose.yml`; environment detection does not change the deployed stack. Every deploy runs `docker compose down`, causing full-stack downtime. |
+| `deploy.sh` | Supporting/manual | Interactive branch creation/deployment helper and optional EC2 security-group changes | Hardcodes a host/user and expects a local private key. It derives version-bump type from changed paths; it is not the CI deployment entry point. |
+| `promote.sh` | Likely legacy/inconsistent | Intended to tag dev images as prod and provide image backups | Refers to dev containers/images not created by active root Compose. Rollback loads an image twice and restarts both services without independently restoring/tagging both images correctly. |
+| `cleanup_ec2.sh` | Supporting/manual | EC2 cleanup utility | Operational script; should be reviewed and run only with explicit production procedure. |
+| `docker-compose.dev.yml` | Legacy/incomplete | Defines only dev summary and phase services | Not selected by CI, contains no orchestrator or Nginx, and uses port mappings different from the active root stack. |
+| `docker-compose.prod.yml` | Legacy/incomplete | Defines only prod summary and phase services | Not selected by CI and omits orchestrator and Nginx. |
+| Root `Dockerfile` | Broken/obsolete | Earlier single-container phase cron image | Its command references missing `LLM/phase-analysis/cron_phase_analysis.py`. It is not used by active root Compose. |
+| `bulk_ec2_executions/simulate_change_stream_load.py` | Legacy test utility | Simulates an older change-stream/load design | Documentation and assumptions reference the removed durable queue and old architecture. Not an automated current-stack test. |
+| `ORCHESTRATOR_ARCHITECTURE.md` | Stale documentation | Describes earlier orchestration behavior | Contains earlier thresholds/sources and should not be used as the current operational specification. |
 
-These are the points worth confirming with the previous developer because they represent business intent or live production state, not facts that static source review alone can prove:
+---
 
-1. **Clinical scope:** Which diagnoses, procedures, and rehabilitation protocols are officially supported and clinically approved?
-2. **Clinical ownership:** Who signs off generated output, and what is the correction/escalation process for an inaccurate report?
-3. **Manual-generation policy:** Should Generate always force a fresh result, or intentionally return “up to date” when no tracked change exists?
-4. **Production security boundary:** Which gateway, identity system, network rule, and user roles protect access to patient data and generation endpoints?
-5. **Production service levels:** What latency, availability, retry, and incident-response targets were agreed with the client?
-6. **Live operational ownership:** Who monitors queue failures, AI failures, MongoDB change streams, cost, and deployment health?
-7. **Data governance:** What consent, retention, residency, audit, and redaction policies apply to patient data sent to Vertex AI and search grounding?
-8. **Client acceptance:** Which sample outputs and measurable acceptance criteria have been approved by the client?
+## 5. Active AI calls and true cost shape
 
-Everything else—service responsibilities, ports, endpoints, queue rules, collections, models, processing flow, and deployment definitions—should be obtained directly from the repository and live environment rather than asked as basic KT questions.
+### 5.1 Normal model-generation count per patient
 
-### 11. Final summary
+| Pipeline stage | Normal generations | Notes |
+|---|---:|---|
+| Evidence-Based Assessment | 1 | Uses Google Search grounding |
+| Concise Summary | Up to approximately 6 | One generation for each selected verbose section |
+| Phase Intelligence | 1 | Separate phase prompt and response |
+| **Combined automatic run** | **Approximately 8** | This is the normal code-path estimate, before retries/fallbacks |
 
-Remember the system in three lines:
+The code therefore does not make only one summary call and one phase call. The clinical summary is a multi-generation pipeline.
 
-> **The Orchestrator decides when processing runs.**
->
-> **The Clinical Auditor explains the patient's overall clinical status.**
->
-> **Phase Analysis explains where the patient is in the rehabilitation journey.**
+### 5.2 Retry amplification
 
-The full client statement is:
+- The EBA completeness loop may regenerate the entire report up to three times.
+- EBA model fallback can try five model names with two attempts per model for qualifying failures.
+- The concise workflow can retry its entire section pipeline up to three times when final validation fails.
+- Each concise section also has its own retry and model-fallback behavior.
+- Phase analysis can try four model names with three attempts per model for qualifying failures.
 
-> Stance converts fragmented clinical and VALD history into a chronological patient view, then uses specialized AI services to generate a concise clinical summary and a phase-wise rehabilitation analysis. A central orchestrator controls processing, while clinicians retain responsibility for reviewing and acting on the results.
+These are theoretical failure-path maxima, not normal billing counts. Their significance is that layered retries are not governed by one total attempt or cost budget. A provider incident can create a much larger burst than the orchestrator's dispatch count indicates.
+
+### 5.3 Why the existing cost report is not authoritative
+
+The orchestrator uses fixed configured estimates of `$0.67` per summary and `$0.45` per phase, and records `$1.12` when both are assumed to run. It does not read model usage metadata, prompt tokens, output tokens, grounding charges, retries, model fallback choice, or failed-call consumption.
+
+It also:
+
+- Counts completed queue rows, although the queue is marked complete at request acceptance.
+- Assumes phase runs equal summary runs whenever phase is globally configured.
+- Cannot correctly represent manual single-pipeline runs.
+- Reuses one patient queue row, so daily counts can miss or misclassify executions depending on timestamps.
+
+The cost report is therefore an operational estimate only, not a billing reconciliation.
+
+---
+
+## 6. Unnecessary and duplicated work
+
+### 6.1 Repeated MongoDB loading
+
+For the active summary path:
+
+1. `run_audit_by_stance_id.py` loads clinical history for patient metadata.
+2. It constructs a `ChronologicalDataProcessor`, which loads clinical history and VALD data.
+3. It then creates `AgentDataPipeline`, which constructs another processor and loads clinical history and VALD data again.
+
+The phase service independently creates another `AgentDataPipeline` and reloads both datasets.
+
+For an automatic combined summary-and-phase run, the code path therefore performs approximately:
+
+- Four clinical-history reads.
+- Three VALD reads.
+
+This estimate excludes retry-related reruns. A single immutable patient snapshot could reduce these to one clinical read and one VALD read: about a 75% reduction in clinical-read count and a 67% reduction in VALD-read count for the combined path.
+
+`summary_api.py` also tries a preliminary `from LLM.agent_data_pipeline import AgentDataPipeline`. The real file is under `LLM/shared`, so the import fails and is swallowed. It currently causes a predictable exception and misleading log entry on every summary. Fixing the import without removing duplication would add yet another complete data load.
+
+### 6.2 Prompt and memory duplication
+
+The clinical loader extracts useful fields but also attaches the complete source report as `raw_data`. The chronological processor nests that record under an event `data` field, and the agent transformer nests it again under `full_data`. The resulting structure is serialized for AI prompts.
+
+Consequences:
+
+- Larger prompt token usage and model cost.
+- More application memory and serialization time.
+- More patient information sent to the model than may be required.
+- Harder debugging because the same facts exist at multiple nesting levels.
+
+VALD processing also emits repeated exercise data across session-date events. The model should receive a compact, canonical measurement series rather than repeated full exercise objects.
+
+### 6.3 Unnecessary filesystem work
+
+- Both summary and phase pipelines save agent-ready JSON artifacts during production processing.
+- Summary writes the full EBA Markdown and concise Markdown, then reparses the concise output from disk rather than using the in-memory string.
+- Phase writes Markdown and CSV before parsing and saving the in-memory report to MongoDB.
+- Summary and phase can write patient-named artifacts concurrently, creating overwrite/race and retention concerns.
+
+Production should persist only explicitly required audit artifacts, use unique job IDs if retained, enforce encryption/retention, and otherwise parse responses in memory.
+
+### 6.4 Unnecessary AI work
+
+The concise agent extracts both main sections and subsections, then processes several verbose entries independently. Parent content such as the clinical audit and rehabilitation journey can overlap their extracted subsections, so the same source text is summarized more than once.
+
+Best option: ask the initial EBA generation to return the final concise structured schema and eliminate the per-section agent. This changes the normal summary call count from roughly seven generations to one, an approximately 86% call-count reduction. Actual financial savings must be verified using token telemetry because model, grounding, and token prices differ.
+
+If a long human-readable EBA is still a requirement, retain it as an optional artifact and create the final structured summary with one additional model call, not six section calls.
+
+Google Search grounding is enabled for every EBA run. Evidence that is protocol-level rather than patient-specific should be refreshed on a controlled schedule and cached by diagnosis/protocol/version. Patient data should not be included in search-oriented context unless required and approved.
+
+---
+
+## 7. Reliability and correctness findings
+
+### P0 — Dispatch acceptance is incorrectly treated as job completion
+
+The orchestrator calls the two REST endpoints. Both immediately schedule background work and return 2xx. The orchestrator then calls `mark_done`, clears pending edits, and records completion before Gemini generation or MongoDB persistence has finished.
+
+Impact:
+
+- Failed background work can appear successful.
+- Pending changes can be cleared without a result.
+- Cost reports count acceptance, not completed generation.
+- Retry logic protects only the HTTP handoff, not the actual AI work.
+
+Required design: use a durable job ID and a completion callback/status poll, or let the downstream request remain open until persistence succeeds. Queue completion must occur only after verified persistence.
+
+### P0 — Shared queue checkpoint corrupts single-pipeline state
+
+`mark_done` always stamps `last_summary_generated` and clears both clinical and VALD edit arrays. It only stamps the phase timestamp conditionally.
+
+Consequences:
+
+- A phase-only run falsely records summary completion.
+- A summary-only run clears edits that phase analysis still needs.
+- Edits arriving while work is in flight can be erased.
+
+Required design: maintain separate per-pipeline state, watermarks, attempts, and completion timestamps. A job should capture a source-version watermark and clear only events at or before that watermark after that specific pipeline succeeds.
+
+### P0 — First manual request can be rejected as up to date
+
+When a patient queue row is first inserted, both edit arrays are empty and both generation timestamps are `None`. `_is_up_to_date` returns true solely because the arrays are empty. The first manual generation can therefore return `up_to_date` even when no result exists.
+
+Required design: the relevant result document or successful generation timestamp must exist before a pipeline can be considered current.
+
+### P0 — Credentials in source control
+
+The repository tracks service-account JSON files and a PEM private key. The audit runner also includes a hardcoded MongoDB URI fallback containing credentials.
+
+Required action:
+
+1. Revoke and rotate all affected Google, MongoDB, and SSH credentials.
+2. Remove them from Git history, not only the latest commit.
+3. Use a managed secret store or protected CI secrets with instance roles where possible.
+4. Add secret scanning and pre-commit/CI prevention.
+
+### P1 — Phase up-to-date notification is broken
+
+The phase `ConnectionManager` implements `send` and `send_json`, but `/up-to-date` calls `manager.broadcast`. That route returns 500. The orchestrator does not call `raise_for_status` or otherwise inspect non-2xx responses in its notification method, so the failure is effectively hidden.
+
+### P1 — Phase progress does not reach the triggering WebSocket
+
+Manual WebSocket requests delegate to the orchestrator. The orchestrator then calls the phase REST endpoint, whose background job does not associate itself with or broadcast to the original connection. The frontend receives acceptance but not the documented phase progress sequence.
+
+### P1 — Manual trigger can create duplicate execution
+
+`manual_trigger` unconditionally writes queue status back to `pending`, including for a row already in flight. A second manual click can therefore interfere with or duplicate an active job.
+
+### P1 — Partial pipeline retry can duplicate successful work
+
+Summary and phase are dispatched concurrently. If one accepts and the other fails, the entire row returns to pending. A later retry can call both again because successful per-pipeline state is not persisted.
+
+### P1 — External summary supersession likely uses the wrong type
+
+The supersession query uses `{"patient": patient_id}` where `patient_id` is a string. The summary writer stores `patient` as a MongoDB `ObjectId`. This check will normally fail for ObjectId-backed documents.
+
+### P1 — TLS verification is disabled in active loaders
+
+Clinical and VALD Mongo clients set invalid-certificate and invalid-hostname allowances. This removes server identity protection and should not be used for MongoDB Atlas production traffic.
+
+### P1 — API security boundary is absent in code
+
+The REST and WebSocket endpoints contain no authentication or authorization. CORS permits all origins. Root Compose publishes ports 5001, 5002, and 5003 on the host, bypassing the expectation that Nginx is the only public entry point.
+
+At minimum, bind internal ports only to the Docker network, authenticate at the gateway and/or services, authorize patient access, rate limit generation endpoints, restrict CORS, and record auditable actor identity.
+
+### P1 — Deployment environment selection is incorrect
+
+The workflow detects `-dev` versus `-prod`, but assigns `docker-compose.yml` in both cases and never uses its `compose_file` output. The root file defines prod-named containers and production collection variables. A dev-branch push therefore rebuilds the same root stack unless external conditions not represented in this repository intervene.
+
+### P2 — Operational weaknesses
+
+- Full `docker compose down` creates avoidable downtime on each deployment.
+- Source bind mounts allow runtime code to differ from the built image.
+- Mixed Python 3.11 and 3.13 versions increase compatibility variance.
+- Jobs and connection state are in memory and grow without a retention policy.
+- Per-patient lock objects are created but never used or pruned.
+- Multiple `MongoClient` objects are created in one request instead of using process-level clients.
+- A new `httpx.AsyncClient` is created for every scheduler and notification request.
+- Extensive debug `print` output can expose patient metadata/content and increases log volume.
+- Model prompts contain a fixed 2020–2024 evidence instruction, which is stale in 2026.
+- Summary code logs the first portion of the MongoDB URI. Even partial credential-bearing URIs should never be logged.
+- `/ws/audit/{patient_id}` awaits a synchronous `connect` method and is likely broken if used.
+
+---
+
+## 8. Dependency audit
+
+The summary and phase requirements install the same broad dependency set. Static import review found no active application imports of:
+
+- `langchain`
+- `langchain-google-vertexai`
+- `google-cloud-aiplatform`
+- `google-api-python-client`
+- direct `google-auth` APIs
+
+The active AI implementation imports the `google-genai` SDK dynamically. `websockets` is directly used only by the old load-simulation script; FastAPI/Starlette handles the deployed WebSocket endpoints. These packages may include transitive/runtime needs, so removal must be confirmed in a clean container test, but they should not remain without an explicit reason.
+
+Other dependency issues:
+
+- Summary and phase directly import `httpx` but do not declare it. They currently rely on a transitive dependency.
+- The load simulator imports `requests`, but no current service requirement explicitly declares it.
+- Summary and phase dependencies use broad minimum versions instead of a lock file or hashes.
+- `LLM/requirements.txt` duplicates service requirements, contains duplicate entries, and belongs to the obsolete root Dockerfile path.
+
+Recommended action: create a small pinned requirement/lock set per service, declare all direct imports, build without runtime bind mounts, and run import plus endpoint smoke tests against the clean images.
+
+---
+
+## 9. Legacy and removal candidates
+
+### Safe first candidates after a reference/test check
+
+- Entire `LLM/shared/rehabilitation_phases.py` module.
+- Unused `get_patient_lock` and associated lock globals.
+- Old summary `run_audit_for_websocket` functions.
+- Old phase `run_phase_analysis_ws` function.
+- Unused EBA `_generate_comprehensive_web_assessment`, `_extract_key_metrics`, and `_build_vald_exercises_section` methods.
+- Unused chronological `generate_chronological_context` and `save_chronological_report` methods.
+- Unused production `AgentDataPipeline.get_agent_ready_data` method.
+- Old `USE_FIRST_AGENT` and “first/second/third agent” branches when no first-agent implementation exists.
+- `DISABLE_CHANGE_STREAMS` environment entries, which current Python code never reads.
+- Obsolete root Dockerfile and duplicate root requirements.
+
+### Move to a clearly separated `tools/` or `archive/` area if still needed
+
+- `export_patient_raw_data.py`
+- `export_vald_data.py`
+- `simulate_change_stream_load.py`
+- CLI-only report-file processing paths
+- Old architecture documentation
+
+### Do not delete without operational confirmation
+
+- `deploy.sh`, `promote.sh`, and `cleanup_ec2.sh`, because external operators may still invoke them manually.
+- Alternate Compose files, until the intended dev/prod deployment model is confirmed and replaced.
+
+Legacy removal should follow characterization tests so that accidental external usage is not confused with internal imports.
+
+---
+
+## 10. Recommended target architecture
+
+```text
+Authenticated API / WebSocket gateway
+  -> durable per-pipeline job record with idempotency key
+  -> one patient snapshot service/load per source version
+       -> compact validated clinical + VALD schema
+       -> Summary worker: one structured Gemini generation
+       -> Phase worker: one structured Gemini generation
+  -> schema validation
+  -> atomic MongoDB upsert
+  -> worker completion event
+  -> per-pipeline queue checkpoint
+  -> JSON WebSocket status event
+  -> actual token/model/grounding/cost telemetry
+```
+
+Key characteristics:
+
+- One immutable snapshot is reused by both pipelines.
+- Summary and phase have separate job IDs, status, retries, and source watermarks.
+- Model output uses JSON schema/structured response rather than Markdown as an integration contract.
+- Each output upsert includes source version, prompt version, model, usage, job ID, generated time, and validation status.
+- Generation is idempotent for `(patient_id, pipeline, source_version, prompt_version)`.
+- Completion means validated MongoDB persistence, not HTTP acceptance.
+- Search grounding is conditional and protocol evidence is cached separately from patient context.
+
+---
+
+## 11. Prioritized optimization plan
+
+### Phase 0 — Immediate security containment
+
+1. Rotate exposed credentials and remove secrets from Git history.
+2. Remove the hardcoded database URI fallback and fail startup when required secrets are absent.
+3. Stop logging connection strings and patient-content debug data.
+4. Restrict host port exposure; route external traffic only through the protected gateway.
+5. Add authentication, patient-level authorization, CORS allowlists, rate limits, and audit identity.
+6. Restore valid TLS certificate and hostname verification.
+
+### Phase 1 — Correctness before cost work
+
+1. Replace acceptance-based completion with durable downstream job completion.
+2. Split queue state by pipeline and introduce source-version watermarks.
+3. Fix first-generation staleness logic.
+4. Make trigger and persistence operations idempotent.
+5. Preserve edits that arrive during an in-flight job.
+6. Fix phase up-to-date/progress delivery and ObjectId supersession query.
+7. Prevent manual triggers from resetting an active job.
+
+### Phase 2 — Highest-value cost reduction
+
+1. Build the patient snapshot once and reuse it for both services.
+2. Remove `raw_data`/`full_data` duplication and apply MongoDB projections.
+3. Replace six section-level concise calls with one structured-summary generation.
+4. Make grounding conditional and cache non-patient protocol evidence.
+5. Remove default JSON/Markdown/CSV artifact writes from production.
+6. Capture actual model usage metadata and establish per-job token/cost budgets.
+7. Apply one bounded retry policy across the whole generation, with jitter and circuit breaking.
+
+### Phase 3 — Maintainability and operations
+
+1. Split large API, prompt, parser, persistence, and job-store responsibilities into typed modules.
+2. Replace Markdown parsers with Pydantic-validated structured model responses.
+3. Reuse MongoDB and HTTP clients per process.
+4. Pin dependencies and build immutable service images.
+5. Correct dev/prod Compose selection and use environment protection/approval for production.
+6. Add rolling or service-by-service deployment and verified rollback.
+7. Add structured logs, metrics, traces, queue dashboards, and alerting.
+8. Prune completed job state and implement data/artifact retention.
+9. Remove confirmed legacy code and stale documentation.
+
+---
+
+## 12. Test strategy currently missing
+
+No automated test suite is present. A minimum production test portfolio should include:
+
+### Unit tests
+
+- Clinical and VALD transformation with missing, malformed, and zero values.
+- Timeline ordering, date handling, first/further interaction logic, and duplicate-session rules.
+- Summary and phase parser/schema validation.
+- Queue threshold, deduplication, watermark, retry, and per-pipeline state transitions.
+
+### Integration tests
+
+- MongoDB source snapshot to structured persisted output using model stubs.
+- Orchestrator dispatch through actual downstream completion.
+- Concurrent summary and phase execution without artifact or state collision.
+- Changes arriving before, during, and after an in-flight job.
+- First manual generation, up-to-date response, retry, partial failure, and restart recovery.
+
+### Contract and security tests
+
+- REST and WebSocket event schemas.
+- Authentication/authorization for every patient and operational route.
+- Prompt/data redaction rules and logs containing no secrets or unnecessary patient data.
+- Clean Docker builds with only declared direct dependencies.
+
+### AI evaluation
+
+- Clinician-approved representative cases and expected structured fields.
+- Hallucination, missing-data acknowledgment, unsupported citation, temporal consistency, and phase-mismatch evaluation.
+- Prompt/model regression suite before promotion.
+- Token, latency, and cost comparison against the current baseline.
+
+---
+
+## 13. Metrics required for real optimization
+
+Every generation job should record:
+
+- Pipeline and job ID.
+- Patient ID in protected/auditable form.
+- Source snapshot/version and prompt version.
+- Requested and actual model.
+- Model attempt/fallback count.
+- Input, cached, reasoning if applicable, and output token usage supplied by the provider.
+- Grounding/search usage.
+- Load, transform, queue, model, parse, and persistence latency.
+- Final validation and persistence result.
+- Estimated and reconciled actual cost.
+- Trigger type: manual, report threshold, VALD threshold, or fallback.
+
+Only after these measurements exist should the team claim a percentage financial saving. The call-count and database-read reductions in this document are code-path estimates, not billing claims.
+
+---
+
+## 14. Genuine KT questions
+
+The following cannot be reliably derived from this repository and are appropriate for the previous developer or product owner. Basic module behavior, ports, thresholds, routes, and known code defects should not be asked as KT questions.
+
+1. Which diagnoses, surgeries, age groups, and rehabilitation protocols are clinically approved for production use?
+2. What clinician validation set and measurable acceptance thresholds were used to approve summary and phase output?
+3. Is the long EBA Markdown report a required business/audit artifact, or is only the structured concise summary consumed?
+4. Must evidence grounding run for every patient generation, and what patient information is approved for transmission to the model/search tool?
+5. What external process creates and updates `structured-user-reports` from `reports`, and what consistency/latency guarantee does it provide?
+6. Which frontend endpoints and WebSocket messages are currently consumed, including any undocumented legacy clients?
+7. What is the intended dev/prod topology on EC2, since the current workflow deploys the same root Compose stack for both branch types?
+8. Which manual operational scripts are still used in real deployments, and what is the verified rollback procedure?
+9. What are the required data retention, residency, consent, access-audit, and deletion policies for patient inputs, prompts, logs, and generated artifacts?
+10. Who owns clinical approval, production incidents, queue failures, model/cost monitoring, and security response?
+11. What latency, availability, throughput, and monthly AI-cost limits are contractually expected?
+12. Should a manual Generate action always force a new analysis, or return up to date when a verified persisted output matches the latest source version?
+
+---
+
+## 15. Short client presentation
+
+### 30-second version
+
+> The platform consolidates a patient's clinical history and VALD measurements into a chronological timeline. A Clinical Auditor creates the overall clinical summary, a Phase Analysis service evaluates rehabilitation stage and gaps, and an Orchestrator controls when those pipelines run. Results are stored as structured MongoDB records for clinician review. The next engineering focus is production hardening, accurate job tracking, and reducing duplicated database and AI processing.
+
+### Technical handover version
+
+> Production is separated into three FastAPI services behind Nginx: summary on port 5001, phase analysis on 5002, and orchestration on 5003. MongoDB change streams feed a per-patient queue. The AI services independently build the same patient timeline and call Gemini, after which Markdown is parsed into MongoDB documents. The architecture is functional, but current completion tracking is acceptance-based, pipeline checkpoints are shared, data loading is duplicated, and the summary path makes multiple model calls. The recommended target is a shared versioned patient snapshot, separate durable per-pipeline jobs, schema-constrained model output, verified completion, and provider-derived cost telemetry.
+
+### Three lines to remember
+
+> **The Orchestrator decides when work runs.**  
+> **The Clinical Auditor explains the patient's overall clinical condition and journey.**  
+> **Phase Analysis explains where the patient is in rehabilitation and what remains.**
+
+---
+
+## 16. Final conclusion
+
+The project has a clear business purpose and a workable service split. Its strongest components are longitudinal clinical/VALD consolidation, separate clinical and phase perspectives, and centralized trigger control. Its largest risks are not the core AI prompts; they are job-state correctness, credential exposure, missing access control, duplicate data/model processing, and deployment ambiguity.
+
+The correct engineering order is:
+
+1. Contain security exposure.
+2. Make completion and per-pipeline queue state correct.
+3. Remove duplicate data loading and section-level AI calls.
+4. Add real usage/cost telemetry and automated tests.
+5. Simplify modules, dependencies, artifacts, and deployment definitions.
+
+Following that sequence will improve reliability first, then materially lower model calls, database work, latency, and operating cost without weakening the clinical output contract.
