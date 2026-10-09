@@ -1,15 +1,18 @@
 # Stance Daily Report
 
-Includes patient accounts with `isActive = true`. Percentages are based on all 7,810 active patients.
+
+Includes patient accounts with `isActive = true`. All percentages use 7,864 active patients.
 
 ## Overall Coverage
 
 | Service | Have data | % | Missing data | % |
 |---|---:|---:|---:|---:|
-| Prognosis | 4,578 | 58.6% | 3,232 | 41.4% |
-| Summary | 3,317 | 42.5% | 4,493 | 57.5% |
-| Phase analysis | 1,704 | 21.8% | 6,106 | 78.2% |
-| VALD measurements | 3,789 | 48.5% | 4,021 | 51.5% |
+| Prognosis | 4,589 | 58.4% | 3,275 | 41.6% |
+| Summary | 3,323 | 42.3% | 4,541 | 57.7% |
+| Phase analysis | 3,555 | 45.2% | 4,309 | 54.8% |
+| VALD measurements | 3,793 | 48.2% | 4,071 | 51.8% |
+
+Phase coverage uses the production collection, `new-patient-phases`.
 
 ## Prognosis
 
@@ -17,67 +20,68 @@ A complete first assessment contains chief complaint, clinical history, subjecti
 
 | Category | Patients | % |
 |---|---:|---:|
-| Complete assessment; prognosis generated | 3,126 | 40.0% |
+| Complete assessment; prognosis generated | 3,137 | 39.9% |
 | Complete assessment; prognosis missing | 46 | 0.6% |
-| Assessment absent, empty, or incomplete | 4,638 | 59.4% |
-| **Total** | **7,810** | **100%** |
+| Assessment absent, empty, or incomplete | 4,681 | 59.5% |
+| **Total** | **7,864** | **100%** |
 
 Of the 46 patients with a complete assessment but no prognosis, 7 have multiple first assessments and 39 have no confirmed execution status.
 
-The 4,638 patients without a complete assessment include 1,452 with saved prognosis. These are included in the overall prognosis count of 4,578.
+The 4,681 patients without a complete assessment include 1,452 with saved prognosis. These are included in the overall prognosis count of 4,589.
 
 ## Summary and Phase Analysis
 
-Automatic enrollment covers seven configured centers. Scheduling uses 5 queued report references, 5 queued VALD references, or the 15-day fallback with recorded activity.
+| Category | Summary | % | Phase | % |
+|---|---:|---:|---:|---:|
+| Generated output exists | 3,323 | 42.3% | 3,555 | 45.2% |
+| Output missing | 4,541 | 57.7% | 4,309 | 54.8% |
+| **Total active patients** | **7,864** | **100%** | **7,864** | **100%** |
+
+### Additional condition breakdown
+
+These rows split the generated and missing totals above; they do not replace them. All percentages use 7,864 active patients.
 
 | Category | Summary | % | Phase | % |
 |---|---:|---:|---:|---:|
-| Generated data exists | 3,317 | 42.5% | 1,704 | 21.8% |
-| Missing; queued and not yet due | 310 | 4.0% | 1,286 | 16.5% |
-| Missing; configured-center appointment exists, but no queue record | 1,804 | 23.1% | 2,431 | 31.1% |
-| Missing; no configured-center appointment or queue record | 2,379 | 30.5% | 2,389 | 30.6% |
-| **Total** | **7,810** | **100%** | **7,810** | **100%** |
+| Saved-data condition matched; output generated | 1,727 | 22.0% | 1,725 | 21.9% |
+| Saved-data condition matched; output missing | 203 | 2.6% | 205 | 2.6% |
+| Condition not established from saved data; output generated | 1,596 | 20.3% | 1,830 | 23.3% |
+| Condition not established from saved data; output missing | 4,338 | 55.2% | 4,104 | 52.2% |
+| **Total active patients** | **7,864** | **100%** | **7,864** | **100%** |
 
-For patients without a queue record, generation eligibility and the reason for missing enrollment are not established. Queue thresholds do not represent lifetime attended sessions.
+**Condition matched:** At least 5 distinct saved reports with content, or 5 distinct saved VALD profile/document references, or a database-confirmed 15-day fallback with activity. This is a current saved-data check, not a reconstruction of past scheduler decisions.
+
+**Condition not established:** The current records do not establish that rule. This does not mean the patient failed the generation conditions when their output was created. Completed processing can clear activity counters; direct requests and earlier fallback processing can also produce outputs. Individual historical triggers have not been verified.
+
+**How the totals reconcile:** Summary generated is 1,727 + 1,596 = **3,323**. Phase generated is 1,725 + 1,830 = **3,555**. Missing totals are 203 + 4,338 = **4,541** and 205 + 4,104 = **4,309**, respectively.
+
+**Earlier Phase count correction:** The previously reported 1,704 came from the legacy collection. Production writes to `new-patient-phases`, which gives **3,555** for this snapshot. The matched group of 1,725 is only part of that total.
 
 ## VALD Connection
 
 | Category | Patients | % |
 |---|---:|---:|
-| Valid profile mapping | 6,638 | 85.0% |
-| Not mapped | 1,172 | 15.0% |
-| **Total** | **7,810** | **100%** |
+| Valid profile mapping | 6,659 | 84.7% |
+| Not mapped | 1,205 | 15.3% |
+| **Total** | **7,864** | **100%** |
 
 ## VALD Measurements
 
 | Category | Patients | % |
 |---|---:|---:|
-| Saved measurements exist | 3,789 | 48.5% |
-| Mapped; no saved measurements; reason unknown | 2,849 | 36.5% |
-| No sync record or mapping found | 1,113 | 14.3% |
-| Mapping missing or invalid; no saved measurements | 59 | 0.8% |
-| **Total** | **7,810** | **100%** |
+| Saved measurements exist | 3,793 | 48.2% |
+| Mapped; no saved measurements; reason unknown | 2,866 | 36.4% |
+| **Total for these two categories** | **6,659** | **84.7%** |
 
-A profile mapping does not confirm that measurements have synced.
+The subtotal covers only the two categories shown. Overall missing-measurement coverage is shown in the first table.
 
-## VALD Force Changes Across Dates
-
-| Category | Patients | % |
-|---|---:|---:|
-| Increases only, with or without unchanged values | 248 | 3.2% |
-| Decreases only, with or without unchanged values | 24 | 0.3% |
-| Mixed increases and decreases | 457 | 5.9% |
-| Measurements exist; no supported comparison | 3,060 | 39.2% |
-| No measurements | 4,021 | 51.5% |
-| **Total** | **7,810** | **100%** |
-
-729 patients have supported comparisons of positive average or maximum force in newtons across different IST dates, matching product, exercise, movement, metric, and side. Differing same-day attempts are excluded. These are numeric changes; clinical improvement requires clinician review.
-
-## Yesterday — 7 October 2026, IST
+## Yesterday — 8 October 2026, IST
 
 | Service | Patients with first creation recorded | % |
 |---|---:|---:|
-| Prognosis | 14 | 0.2% |
-| Summary | 4 | 0.1% |
-| Phase analysis | 0 | 0.0% |
+| Prognosis | 4 | 0.1% |
+| Summary | 8 | 0.1% |
+| Phase analysis | 13 | 0.2% |
+
+
 
